@@ -1,0 +1,8 @@
+{
+  "include": ["."],
+  "exclude": ["DataAgent-env", "vector_db", "__pycache__"],
+  "venvPath": ".",
+  "venv": "DataAgent-env",
+  "pythonVersion": "3.10",
+  "typeCheckingMode": "basic"
+}

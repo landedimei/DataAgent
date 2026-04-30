@@ -1,0 +1,43 @@
+# 环境变量与密钥，切勿提交
+.env
+
+# 向量数据库存储目录
+vector_db/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# 虚拟环境（本地命名）
+DataAgent-env/
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 调试落盘：若开启简历/JD 持久化，可在此增加路径
+# debug_uploads/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# 测试与覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db

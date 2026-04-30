@@ -1,0 +1,26 @@
+# Web UI
+streamlit>=1.32.0
+
+# 通义千问等：OpenAI 兼容 HTTP 接口
+openai>=1.30.0
+
+# 配置：从 .env 加载环境变量
+python-dotenv>=1.0.0
+
+# 向量库（本地持久化）
+chromadb>=0.4.24
+
+# 文档解析
+pdfplumber>=0.11.0
+python-docx>=1.1.0
+markdown-it-py>=3.0.0
+
+# 可选：本地 Embedding 离线方案（与 rag_engine 中可选分支对应）
+# sentence-transformers>=2.2.0
+# torch 体积较大，需要离线向量时再单独安装
+
+# HTTP 重试
+tenacity>=8.2.0
+
+# 开发 / 自测
+pytest>=8.0.0

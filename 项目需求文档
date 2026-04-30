@@ -1,0 +1,169 @@
+1. 项目背景与目标
+建立一个针对“数据开发（DE）”岗位的智能面试辅导 Agent。用户通过对话形式获取针对性的面试指导、知识解答、简历分析及模拟面试。
+核心原则：不使用重型框架（如 LangChain），采用纯 Python + OpenAI SDK 兼容模式（调用通义千问）+ Streamlit。
+
+2. 基础架构设计（4-Layer Architecture）
+交互层 (UI Layer): 基于 Streamlit 构建。提供聊天窗口、文件上传（简历/JD）、侧边栏配置（API Key 等）。
+
+核心控制层 (Agent Brain):
+
+Intent Router（意图路由）：识别用户是在咨询知识、投递 JD、要求模拟面试还是上传简历。
+  - 推荐实现：LLM zero-shot/few-shot 分类 + 关键词规则兜底
+  - 主路由：调用通义千问做零样本分类，输出意图标签（knowledge / jd_analysis / resume_upload / mock_interview / general）
+  - 兜底策略：关键词匹配（"简历"、"JD"、"模拟面试"），防止分类失败时代码卡死
+
+Reasoning（逻辑推理）：基于 ReAct 模式判断是否需要调用工具。
+
+工具层 (Tool Layer):
+
+analyze_jd：JD 关键词提取。
+
+analyze_resume_gap：简历与 JD 匹配度分析。
+
+rag_search：本地知识库检索。
+
+mock_interview_controller：控制模拟面试的状态流转。
+
+数据/检索层 (RAG Layer):
+
+向量数据库：ChromaDB（本地持久化）。
+
+Embedding：使用通义千问 Embedding API 或本地开源 Embedding 模型。
+
+RAG 检索策略：
+  - 文档分块（Chunking）：建议 chunk_size=500，overlap=50
+  - Top-K 检索：默认取 K=4 条最相关块
+  - 支持多轮追问（基于会话历史扩展检索上下文）
+
+3. 核心功能点
+意图识别 (Intent Routing)：智能判断用户输入。
+
+JD 深度分析：用户粘贴 JD 后，Agent 总结核心技术栈及高频考点。
+
+RAG 知识库问答：基于本地 DE 面试题库文档进行精准回答，并推荐相关题目。
+
+简历 Gap 分析：对比简历与 JD，指出技术短板。
+
+模拟面试模式：Agent 开启“面试官模式”，逐个提问并记录评价用户回答。
+  - 面试过程中需维护完整对话上下文（用户回答 + 历史问题），用于最终综合评价
+  - Agent 在面试结束后生成综合评价报告（技术深度、表达逻辑、改进建议）
+
+4. 技术栈选型
+语言：Python 3.10+
+
+LLM API：通义千问 (OpenAI-compatible SDK)
+
+Web UI：Streamlit
+
+向量库：ChromaDB
+
+文档解析：pdfplumber（PDF解析）或 PyMuPDF（PDF解析，可选） / markdown-it-py（MD解析）
+
+Embedding 模型：通义千问 Embedding API 或本地开源模型（如 sentence-transformers）
+
+
+
+---
+
+5. 技术栈补充说明
+
+| 场景 | 推荐方案 | 说明 |
+|------|---------|------|
+| PDF 解析 | pdfplumber | 维护活跃，社区广泛 |
+| MD 解析 | markdown-it-py | 轻量，支持插件扩展 |
+| Embedding | 通义千问 API | 成本低，效果稳定；可选 sentence-transformers 做离线方案 |
+| 会话状态 | Streamlit session_state | Streamlit 内置，无需额外依赖 |
+
+---
+
+6. 不再推荐的技术
+
+- PyPDF2：已停止维护，不再更新
+- LangChain：项目明确不使用重型框架
+
+---
+
+7. 错误处理与容错策略
+
+API 调用容错：
+  - 超时重试：单次请求超时时间设为 60s，最多重试 3 次（指数退避）
+  - API Key 缺失：启动时检测，未配置则弹出友好提示并阻止运行
+  - 模型返回格式错误：捕获异常，写入日志，返回"抱歉，服务暂时不可用，请稍后重试"
+
+RAG 检索容错：
+  - 向量库为空时：提示用户"知识库为空，请先上传 DE 面试资料"
+  - 检索结果为空时：降级为纯 LLM 知识回答，不阻塞对话
+
+---
+
+8. Session 管理与多轮对话
+
+- 使用 Streamlit 内置的 session_state 存储对话历史和意图状态
+- 每次用户提交：读取 session_history → 拼接上下文 → 调用 LLM → 更新 history
+- 简历/JD 分析结果存入 session_state，供后续模拟面试复用
+
+---
+
+9. 安全与隐私规范
+
+- 上传的简历/JD 默认不持久化到磁盘；如需调试落盘，必须提供显式开关并在文档中标注风险
+- API Key 存储在 .env 文件，不硬编码、不提交到版本控制
+- .gitignore 需包含：.env、vector_db/、__pycache__/、.idea/
+
+---
+
+10. 项目目录结构建议
+```text
+DataAgent/
+├── app.py              # Streamlit 主程序入口
+├── agent_brain.py      # Agent 核心逻辑（意图识别、ReAct 循环）
+├── tools.py            # 具体工具函数实现
+├── rag_engine.py       # RAG 检索逻辑、文档向量化处理
+├── config.py           # 配置管理（API Key 加载、超参配置）
+├── requirements.txt    # 依赖包列表
+├── .env                # 环境变量（API Key，不提交）
+├── .gitignore          # Git 忽略配置
+├── data/               # 存放原始面试资料 (PDF/MD)
+├── vector_db/          # ChromaDB 持久化存储目录
+└── tests/              # 单元测试（后续补充）
+```
+
+11. 初始化任务要求
+生成 requirements.txt。
+
+编写 app.py 基础布局：包含聊天界面和侧边栏。
+
+编写 agent_brain.py：实现一个简单的 OpenAI 兼容调用类，能连接通义千问 API。
+
+实现基础的“工具调用”原型：当用户输入包含“JD”时，触发一个模拟的 analyze_jd 函数。
+
+12. 开发者背景与 AI 协作规范（非常重要！）
+我是这个项目的主导者，但我的 Python 基础比较薄弱，也没有 Web 开发经验。开发这个 Demo 的核心目的之一是通过动手实践来学习 Agent 和 RAG 的底层原理与代码实现。
+因此，作为我的 AI 辅助开发伙伴，在接下来的所有协作中，请你严格遵守以下原则：
+
+分步引导，拒绝代码轰炸：请把复杂任务拆解为小步骤。每次只给我一个模块或几个函数的代码，跑通后再进入下一步。
+
+保姆级代码注释：生成的每一段核心代码，必须包含详尽的中文注释。不仅要注释“这行代码在做什么”，还要注释“为什么这么写”。
+
+授人以渔的教学模式：在给出代码前或后，请用简单通俗的语言解释代码背后的逻辑和数据流向（例如：用户输入如何变成向量、模型如何返回结果）。
+
+耐心答疑：如果我对某些 Python 语法（如装饰器、类、异步处理等）或报错有疑问，请耐心为我解答。
+
+---
+
+13. 测试与验收标准
+
+功能验收：
+  - [ ] API Key 未配置时，App 启动失败并给出明确提示
+  - [ ] 上传简历后，Agent 能正确解析并总结关键信息
+  - [ ] 上传 JD 后，Agent 能提取核心技术栈
+  - [ ] RAG 问答能返回相关知识点，而非泛泛而谈
+  - [ ] 模拟面试能持续多轮提问并生成最终评价
+  - [ ] 所有异常都能被捕获，不出现未处理报错
+
+非功能性验收：
+  - [ ] 首轮响应时间 < 5s（不含外部 API 网络延迟）
+  - [ ] Streamlit App 可通过 `streamlit run app.py` 正常启动
+
+14.环境搭建：
+帮我在该目录下创建一个虚拟环境，命名为DataAgent-env，并对齐激活，后续在这个虚拟环境中进行开发，并安装依赖。
