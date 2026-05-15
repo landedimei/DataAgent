@@ -42,6 +42,9 @@ if not DASHSCOPE_API_KEY:
 # ---------------------------------------------------------------------------
 LLM_TIMEOUT_SECONDS: float = float(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
 LLM_MAX_RETRIES: int = int(os.getenv("LLM_MAX_RETRIES", "3"))
+# Embedding 常为批量调用，网络抖动时易出现 ConnectTimeout，可单独调大超时与重试次数
+EMBEDDING_HTTP_TIMEOUT_SECONDS: float = float(os.getenv("EMBEDDING_HTTP_TIMEOUT_SECONDS", "180"))
+EMBEDDING_MAX_RETRIES: int = int(os.getenv("EMBEDDING_MAX_RETRIES", "4"))
 
 # ---------------------------------------------------------------------------
 # RAG 分块与检索
@@ -49,6 +52,13 @@ LLM_MAX_RETRIES: int = int(os.getenv("LLM_MAX_RETRIES", "3"))
 RAG_CHUNK_SIZE: int = int(os.getenv("RAG_CHUNK_SIZE", "500"))
 RAG_CHUNK_OVERLAP: int = int(os.getenv("RAG_CHUNK_OVERLAP", "50"))
 RAG_TOP_K: int = int(os.getenv("RAG_TOP_K", "10"))
+# 混合检索：BM25 与向量检索的权重。向量权重越大，语义越重要；BM25 越大，关键词匹配越重要。
+RAG_HYBRID_ALPHA: float = float(os.getenv("RAG_HYBRID_ALPHA", "0.6"))
+# 检索结果相似度阈值：低于此分数的向量检索结果会被过滤掉，避免返回不相关的内容
+RAG_SIMILARITY_THRESHOLD: float = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.3"))
+# 动态 Top-K：根据查询复杂度调整返回条数的范围
+RAG_TOP_K_MIN: int = int(os.getenv("RAG_TOP_K_MIN", "3"))
+RAG_TOP_K_MAX: int = int(os.getenv("RAG_TOP_K_MAX", "15"))
 
 # Chroma 持久化目录：相对项目根，便于和 .gitignore 里 vector_db/ 一致
 CHROMA_PERSIST_DIR: Path = _PROJECT_ROOT / "vector_db"
