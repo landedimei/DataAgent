@@ -2,13 +2,7 @@
 """
 app.py — Streamlit 主入口（交互层）
 
-运行方式（在项目根目录、已激活虚拟环境的前提下）:
-    streamlit run app.py
-
-数据流简图:
-用户打开浏览器 → 本脚本渲染侧栏+聊天区 → 用户输入/上传
-→ 若 API Key 合法则把文本交给 agent_brain.run_agent_turn
-→ 将助手回复拼进 st.session_state["messages"] 再 re-run 显示。
+运行：在项目根执行  streamlit run app.py
 """
 from __future__ import annotations
 
@@ -17,56 +11,81 @@ import sys
 from typing import Any
 
 import streamlit as st
+from openai import APITimeoutError
 
 import config
-from agent_brain import QwenClient, run_agent_turn
+from agent_brain import QwenClient, run_agent_turn_iter
 
-# 基础日志，便于在终端看到 API 侧异常（不暴露 Key）
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
 # ---------------------------------------------------------------------------
-# 页面与 session_state 初始化
+# 页面
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="DE 智能面试辅导 Agent",
-    page_icon="",
+    page_title="DE 面试辅导",
+    page_icon="📋",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
+# 仅用少量样式：不再隐藏 stToolbar，否则侧栏折叠后无法点「展开」箭头
+APP_THEME_CSS = """
+<style>
+    :root {{
+        --kb-accent: #1b4332;
+        --kb-accent-soft: #d8f3dc;
+        --kb-muted: #40916c;
+    }}
+    .kb-hero {{
+        background: linear-gradient(135deg, var(--kb-accent-soft) 0%, #ffffff 55%);
+        border: 1px solid #b7e4c7;
+        border-radius: 12px;
+        padding: 1rem 1.25rem;
+        margin-bottom: 1rem;
+    }}
+    .kb-hero h1 {{
+        margin: 0 0 0.35rem 0;
+        font-size: 1.45rem;
+        color: var(--kb-accent);
+        font-weight: 650;
+    }}
+    footer {{ visibility: hidden; }}
+    #MainMenu {{visibility: hidden;}}
+</style>
+"""
+st.markdown(APP_THEME_CSS, unsafe_allow_html=True)
+
+
 if "messages" not in st.session_state:
-    st.session_state["messages"] = [
-        {
-            "role": "assistant",
-            "content": "你好，我是数据开发（DE）方向的面试辅导助手。可以问我知识点、"
-            "粘贴 JD 做分析，或说「开始模拟面试」。首次使用请先在左侧配置 API Key。",
-        }
-    ]
+    _welcome = """您好，我是**数据开发（DE）方向**的面试与学习助手，可以帮您：
+
+- **知识问答**：数仓、Spark/Flink、SQL、数据质量等；
+- **JD 分析**：粘贴岗位描述（可含「分析」「岗位」等字眼）；
+- **简历对标**：上传简历 + 附带 JD 或先分析 JD，再问「差距」「匹配」等；
+- **模拟面试**：说一句「**开始模拟面试**」，按阶段出题，结束时说「**请总结**」或「**结束面试**」。
+
+需要把教材、面经放进知识库时，请用**左侧栏「资料入库」**；入库后可被对话里的检索引用。
+
+---
+有什么想聊的，直接在下框输入即可。"""
+    st.session_state["messages"] = [{"role": "assistant", "content": _welcome}]
 
 
 # ---------------------------------------------------------------------------
-# 启动时 API Key 校验：未配置则阻止继续使用（功能验收第 1 条）
+# API Key
 # ---------------------------------------------------------------------------
 if not config.is_api_configured():
-    st.error(
-        "未检测到有效的 DASHSCOPE_API_KEY。请在项目根目录创建 `.env` 文件，"
-        "并写入: `DASHSCOPE_API_KEY=你的通义Key`（可参考 `.env.example`）。\n"
-        "出于安全，不要把 Key 写进代码或提交到 Git。"
-    )
+    st.error("请在项目根目录 `.env` 中配置有效的 `DASHSCOPE_API_KEY`。")
     st.stop()
-    # 非 `streamlit run` 时 st.stop 可能不抛异常，避免继续执行导致未初始化 session
     sys.exit(1)
 
-# 能执行到这里，说明可以安全构造客户端（在 Sidebar 中也可展示“已配置”状态）
-# 为减少重复建连，把 client 放 session
 if "qwen" not in st.session_state:
     try:
         st.session_state["qwen"] = QwenClient()
     except Exception as exc:  # noqa: BLE001
-        logger.exception("初始化 QwenClient 失败: %s", exc)
-        st.error("无法初始化大模型客户端，请检查 .env 与网络。将阻止继续操作。")
+        logger.exception("初始化客户端失败: %s", exc)
+        st.error("无法连接模型，请检查 .env 与网络。")
         st.stop()
         sys.exit(1)
 
@@ -74,12 +93,6 @@ llm: QwenClient = st.session_state["qwen"]
 
 
 def _maybe_append_upload_text(user_prompt: str, state: Any) -> str:
-    """
-    若用户刚上传了文件，把其解析文本拼在用户问题后，让下游工具/模型「看得见」内容。
-
-    使用单独函数、并放在 `chat_input` 之前，避免「先调用后定义」在 Streamlit
-    重跑时触发 NameError。
-    """
     name = state.get("last_upload_name")
     b = state.get("last_upload_bytes")
     if not name or b is None:
@@ -90,151 +103,100 @@ def _maybe_append_upload_text(user_prompt: str, state: Any) -> str:
     return user_prompt + "\n\n[上传文件内容]\n" + extra[:15000]
 
 
+def _render_kb_ingest_sidebar() -> None:
+    try:
+        from rag_engine import ingest_uploaded_bytes
+    except ImportError as exc:
+        st.caption(f"知识库不可用：{exc}")
+        return
+
+    kb_file = st.file_uploader(
+        "选择文件",
+        type=["pdf", "md", "txt", "markdown", "docx"],
+        label_visibility="collapsed",
+        key="sb_kb_file",
+    )
+    kb_kind = st.segmented_control(
+        "类型",
+        options=["面试面经", "学习资料"],
+        default="面试面经",
+        key="sb_kb_kind",
+        label_visibility="collapsed",
+    )
+
+    if not st.button("上传并入库", type="primary", use_container_width=True, key="sb_kb_run"):
+        return
+
+    if kb_file is None:
+        st.warning("请先选择文件。")
+        return
+
+    kind = kb_kind if kb_kind in ("面试面经", "学习资料") else "面试面经"
+    cat_key = "interview" if kind == "面试面经" else "learning"
+    raw = kb_file.getvalue()
+
+    try:
+        with st.spinner("入库中…"):
+            result = ingest_uploaded_bytes(raw, kb_file.name, category_key=cat_key)
+        if result.get("ok"):
+            rel = result.get("relative", "")
+            nc = result.get("chunks")
+            tail = f"（{nc} 块）" if isinstance(nc, int) else ""
+            st.success(f"已入库：`{rel}` {tail}".strip())
+        else:
+            st.error(str(result.get("error", result)))
+    except APITimeoutError:
+        st.error(
+            "向量服务请求超时：`dashscope.aliyuncs.com` 无法在设定时间内连通（常见于网络不稳定、"
+            "公司防火墙或需代理）。可在 `.env` 中增大 `EMBEDDING_HTTP_TIMEOUT_SECONDS`（如 `300`），"
+            "并检查本机是否能访问阿里云 DashScope。"
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("入库失败: %s", exc)
+        st.error(str(exc))
+
+
 # ---------------------------------------------------------------------------
-# 侧栏：配置说明与（可选）文件上传
+# 侧栏：入库（箭头收起后仍可点页面左上角「>`」展开；请勿再隐藏 Toolbar）
 # ---------------------------------------------------------------------------
 with st.sidebar:
-    st.header("设置与说明")
-    st.success("API Key 已从环境变量加载（本界面不显示明文）。")
-    st.caption(
-        f"Base URL: `{config.QWEN_BASE_URL}`  |  模型: `{config.QWEN_CHAT_MODEL}`\n\n"
-        f"多轮工具编排（Agent）：**{'已开启（USE_TOOL_AGENT_LOOP）' if config.USE_TOOL_AGENT_LOOP else '关闭（默认仍为「路由+规则」）'}**。"
-    )
-    st.divider()
-    st.subheader("向量知识库")
-    try:
-        from rag_engine import (
-            collection_chunk_count,
-            incremental_sync_from_disk,
-            index_knowledge_base_full_rebuild,
-            ingest_uploaded_bytes,
-            project_data_dir,
-        )
+    st.markdown("###### 资料入库")
+    st.caption("落盘至 data/ 并写入向量库，便于对话检索。")
+    _render_kb_ingest_sidebar()
 
-        kb_count = collection_chunk_count()
-        st.caption(
-            f"当前 **{kb_count}** 条向量  ·  文件放在 `data/{config.KB_DIR_INTERVIEW}/` 或 `data/{config.KB_DIR_LEARNING}/`"
-        )
-        kb_file = st.file_uploader(
-            "上传教材 / 面经（落盘 + 向量化）",
-            type=["pdf", "md", "txt", "markdown", "docx"],
-            key="kb_vector_ingest",
-            help="需 API Key 做 Embedding。文件会保存到 data/ 对应子目录。",
-        )
-        kb_kind = st.radio(
-            "归入类型",
-            ("面试面经", "学习资料"),
-            horizontal=True,
-            key="kb_kind_radio",
-        )
-        if st.button("解析并写入向量库", type="primary", key="kb_ingest_run"):
-            if kb_file is None:
-                st.warning("请先选择一个文件。")
-            else:
-                cat_key = "interview" if kb_kind == "面试面经" else "learning"
-                raw = kb_file.getvalue()
-                with st.spinner("正在解析、切块、写入 Chroma …"):
-                    try:
-                        result = ingest_uploaded_bytes(raw, kb_file.name, category_key=cat_key)
-                        if result.get("ok"):
-                            st.success(f"已保存并索引：`{result.get('relative')}`")
-                            if result.get("sync_detail"):
-                                st.json(result["sync_detail"])
-                        else:
-                            st.error(str(result))
-                    except Exception as exc:  # noqa: BLE001
-                        logger.exception("知识库入库失败: %s", exc)
-                        st.error(f"失败：{exc}")
-
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("增量同步整个 data", key="incr_sync_kb"):
-                with st.spinner("比对 manifest 与文件哈希…"):
-                    try:
-                        st.session_state["_last_kb_sync"] = incremental_sync_from_disk()
-                    except Exception as exc:  # noqa: BLE001
-                        logger.exception("增量同步异常: %s", exc)
-                        st.error(str(exc))
-        with c2:
-            purge = st.checkbox("确认清空后全量重建", key="kb_confirm_rebuild_cb")
-            if st.button("全量重建向量库", key="full_rebuild_kb", disabled=not purge):
-                with st.spinner("清空集合并重新嵌入…"):
-                    try:
-                        r = index_knowledge_base_full_rebuild(clear_before=True)
-                        st.session_state["_last_kb_sync"] = r
-                        st.success("全量重建完成。")
-                    except Exception as exc:  # noqa: BLE001
-                        logger.exception("全量重建失败: %s", exc)
-                        st.error(str(exc))
-        last_sync = st.session_state.get("_last_kb_sync")
-        if isinstance(last_sync, dict):
-            st.caption("最近一次同步结果：")
-            st.json(last_sync)
-        st.caption(f"`data` 根目录：`{project_data_dir()}`")
-    except ImportError as exc:
-        st.info(f"向量库模块不可用：{exc}")
-
-    st.divider()
-    st.subheader("资料上传（实验性）")
-    st.caption(
-        "按需求，上传内容默认不持久化；仅当前会话在内存中解析。"
-        f" 调试落盘开关: {config.PERSIST_UPLOADS_TO_DISK}"
-    )
-    up = st.file_uploader(
-        "简历或 JD 文件（PDF / MD / TXT）",
-        type=["pdf", "md", "txt", "markdown"],
-        key="resume_side_upload",
-    )
-    if up is not None:
-        raw = up.getvalue()
-        st.session_state["last_upload_name"] = up.name
-        st.session_state["last_upload_bytes"] = raw
-        st.info(f"已接收文件 `{up.name}`，大小 {len(raw)} 字节。发送消息时可在逻辑里使用。")
-    st.divider()
-    st.markdown(
-        "操作提示：\n"
-        "- 粘贴 **JD** 并含「分析/岗位」等词 → JD 分析。\n"
-        "- **模拟面试（建议先上传简历 PDF/MD）**：流程为——项目深挖 → 八股与场景 → 开放题 → **SQL** → **算法**。\n"
-        "说「请总结 / 结束面试」生成综合评价。\n"
-        "- 知识库：`data/` 建索引后与面经检索配合。"
-    )
 
 # ---------------------------------------------------------------------------
-# 主区：聊天气泡
+# 主区
 # ---------------------------------------------------------------------------
-st.title("数据开发（DE）智能面试辅导")
-st.caption("纯 Python + OpenAI 兼容 + Streamlit 教学 Demo 框架")
+st.markdown(
+    '<div class="kb-hero"><h1>数据开发 · 面试辅导</h1>'
+    '<p style="margin:0;color:#40916c;font-size:0.95rem;">'
+    "知识问答 · JD · 简历对标 · 模拟面试</p></div>",
+    unsafe_allow_html=True,
+)
+
 
 for m in st.session_state["messages"]:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-# ---------------------------------------------------------------------------
-# 输入框：多轮 session_history → Agent → 写回
-# ---------------------------------------------------------------------------
-if prompt := st.chat_input("输入你的问题、粘贴 JD，或说「开始模拟面试」…"):
+if prompt := st.chat_input("输入消息…"):
     st.session_state["messages"].append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("思考中（含意图路由/可选工具）…"):
-            # session_state 是 dict-like，直接传给 run_agent_turn 以更新 last_intent 等
-            try:
-                reply = run_agent_turn(
+        try:
+            reply = st.write_stream(
+                run_agent_turn_iter(
                     user_text=_maybe_append_upload_text(prompt, st.session_state),
                     session=st.session_state,  # type: ignore[arg-type]
                     llm=llm,
                 )
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("主循环异常: %s", exc)
-                reply = "抱歉，服务暂时不可用，请稍后再试。"
-
-        st.markdown(reply)
-        if st.session_state.get("mock_interview_active"):
-            st.caption("模拟面试进行中；输入「请总结」或「结束面试」可结束并生成评价。")
-        # agent_brain 在命中 RAG 时写入 last_reply_used_rag，供界面提示
-        elif st.session_state.get("last_reply_used_rag"):
-            st.caption("本轮已结合「本地知识库 RAG」检索到的片段作答。")
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("对话异常: %s", exc)
+            reply = "抱歉，暂时不可用，请稍后再试。"
+            st.markdown(reply)
 
     st.session_state["messages"].append({"role": "assistant", "content": reply})

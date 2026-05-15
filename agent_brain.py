@@ -14,7 +14,7 @@ import json
 import logging
 import re
 from enum import Enum
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 from openai import APITimeoutError, OpenAI
 from openai.types.chat import ChatCompletionMessageParam
@@ -96,6 +96,38 @@ class QwenClient:
         if not choice.message or not choice.message.content:
             raise ValueError("模型返回空内容")
         return choice.message.content.strip()
+
+    def stream_chat(self, system_prompt: str, user_prompt: str) -> Iterator[str]:
+        """
+        流式输出：按模型返回的增量逐段 yield，供 Streamlit ``st.write_stream`` 使用。
+        """
+        messages: list[ChatCompletionMessageParam] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        try:
+            stream = self._client.chat.completions.create(
+                model=self._model,
+                messages=messages,
+                temperature=0.3,
+                timeout=config.LLM_TIMEOUT_SECONDS,
+                stream=True,
+            )
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta is None:
+                    continue
+                piece = getattr(delta, "content", None) or ""
+                if piece:
+                    yield piece
+        except (APITimeoutError, TimeoutError) as exc:
+            logger.warning("stream_chat 超时或中断: %s", exc)
+            yield "抱歉，生成回答时网络超时，请稍后再试。"
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("stream_chat 失败: %s", exc)
+            yield "抱歉，服务暂时不可用，请稍后再试。"
 
     @retry(
         stop=stop_after_attempt(config.LLM_MAX_RETRIES + 1),
@@ -325,6 +357,32 @@ def _rag_system_template_for_intent(intent: UserIntent) -> str:
     return RAG_SYSTEM_WITH_CONTEXT
 
 
+def _rag_messages_if_hits(
+    user_text: str,
+    search_query: str,
+    *,
+    intent: UserIntent,
+    user_message_override: str | None = None,
+) -> tuple[str, str] | None:
+    """若检索命中则返回 (system, user_block)；否则 None。"""
+    if is_vector_store_empty():
+        logger.info("RAG: 知识库为空，跳过检索")
+        return None
+    chunks = rag_search(search_query, top_k=config.RAG_TOP_K)
+    if not chunks:
+        logger.info("RAG: 未检索到相关块，将降级为纯 LLM")
+        return None
+    context = _format_rag_context(chunks)
+    system_tpl = _rag_system_template_for_intent(intent)
+    system = system_tpl.format(context=context)
+    body = (user_message_override if user_message_override is not None else (user_text or "")).strip()
+    if intent == UserIntent.MOCK_INTERVIEW:
+        user_block = f"## 用户当前话轮（面试进行中）\n{body}"
+    else:
+        user_block = f"## 用户当前问题\n{body}"
+    return system, user_block
+
+
 def _answer_with_rag_grounding(
     user_text: str,
     llm: QwenClient,
@@ -341,24 +399,16 @@ def _answer_with_rag_grounding(
 
     user_message_override: 多轮模拟面试时传入整段「历史+指令」；为 None 时仅使用 user_text。
     """
-    if is_vector_store_empty():
-        logger.info("RAG: 知识库为空，跳过检索")
+    pair = _rag_messages_if_hits(
+        user_text,
+        search_query,
+        intent=intent,
+        user_message_override=user_message_override,
+    )
+    if pair is None:
         return None
-
-    chunks = rag_search(search_query, top_k=config.RAG_TOP_K)
-    if not chunks:
-        logger.info("RAG: 未检索到相关块，将降级为纯 LLM")
-        return None
-
     used_rag.append(True)
-    context = _format_rag_context(chunks)
-    system_tpl = _rag_system_template_for_intent(intent)
-    system = system_tpl.format(context=context)
-    body = (user_message_override if user_message_override is not None else (user_text or "")).strip()
-    if intent == UserIntent.MOCK_INTERVIEW:
-        user_block = f"## 用户当前话轮（面试进行中）\n{body}"
-    else:
-        user_block = f"## 用户当前问题\n{body}"
+    system, user_block = pair
     return llm.simple_chat(system, user_block)
 
 
@@ -777,20 +827,16 @@ def should_use_jd_tool(user_text: str, intent: UserIntent) -> bool:
     return False
 
 
-def run_agent_turn(
+def run_agent_turn_iter(
     user_text: str,
     session: Mapping[str, Any],
     llm: QwenClient,
-) -> str:
+) -> Iterator[str]:
     """
-    单轮主流程（供 Streamlit 调用）：
+    与 ``run_agent_turn`` 相同路由逻辑。
 
-    1. 读 session 里上一次的 intent、last_user_message（供 RAG 多轮拼检索 query）
-    2. 路由出当前 intent
-    3. 若应跑 JD 工具，则 `analyze_jd` 后返回
-    4. 若命中模拟面试状态机（开局 / 续问 / 终局评价），由该段返回
-    5. 对 knowledge / general 尝试 RAG；mock 仅走状态机内的 `_run_mock_rag_or_llm`
-    6. 否则走纯 LLM 降级
+    对「RAG / 普通对话」的最终答案使用模型 **流式** 增量输出；JD 分析、简历 Gap、
+    模拟面试、Tool Agent 路径仍为整块结果（单次 yield）。
     """
     last = session.get("last_intent") if isinstance(session, Mapping) else None
     intent = route_intent(user_text, llm, last)
@@ -804,20 +850,15 @@ def run_agent_turn(
         if isinstance(session, dict):
             session["last_reply_used_rag"] = False
         _session_note_last_user(session, user_text)
-        # 用 LLM 增强 analyze_jd；若你希望先稳定跑通，可改为 use_llm=False
-        return analyze_jd(
-            user_text,
-            use_llm=True,
-            llm_caller=llm,
-        )
+        yield analyze_jd(user_text, use_llm=True, llm_caller=llm)
+        return
 
-    # ---------- 模拟面试状态机（多轮题/答、RAG+面经、终局评价）— 在通用 RAG 之前处理 ----------
     if isinstance(session, dict):
         m_out = _try_mock_interview_state_machine(user_text, session, llm, intent)
         if m_out is not None:
-            return m_out
+            yield m_out
+            return
 
-    # ---------- 简历 vs JD Gap（须在模拟面试之后，以免打断面试流程）----------
     if (not config.USE_TOOL_AGENT_LOOP) and isinstance(session, dict):
         rp = resolve_resume_plain_for_gap(user_text, session)
         jp = resolve_jd_plain_for_gap(user_text, session)
@@ -829,41 +870,36 @@ def run_agent_turn(
         ):
             session["last_reply_used_rag"] = False
             _session_note_last_user(session, user_text)
-            return analyze_resume_gap(
-                rp, jp, use_llm=True, llm_caller=llm
-            )
+            yield analyze_resume_gap(rp, jp, use_llm=True, llm_caller=llm)
+            return
 
-    # ---------- OpenAI 风格「工具自主决策」多轮循环（替代下方线性 JD/Gap/RAG）----------
     if config.USE_TOOL_AGENT_LOOP and isinstance(session, dict):
         from tool_agent import run_tool_agent_turn
 
         _session_note_last_user(session, user_text)
-        return run_tool_agent_turn(user_text, session, llm)
+        yield run_tool_agent_turn(user_text, session, llm)
+        return
 
-    # ---------- RAG 分支：仅 knowledge / general；mock_interview 已完全由状态机 + _run_mock_rag_or_llm 处理 ----------
-    # used_rag 用列表作可变标记，供 app 侧展示「本轮是否参考了知识库」
-    used_rag_flag: list[bool] = []
     if _intent_allows_rag(intent) and intent != UserIntent.MOCK_INTERVIEW:
         s_q = _build_rag_search_query(user_text, session)
         s_q = _maybe_boost_mock_search_query(s_q, intent)
+        pair: tuple[str, str] | None = None
         try:
-            rag_reply = _answer_with_rag_grounding(
-                user_text, llm, s_q, used_rag=used_rag_flag, intent=intent
-            )
-        except Exception as exc:  # noqa: BLE001 — 检索/模型任一环失败都降级
+            pair = _rag_messages_if_hits(user_text, s_q, intent=intent)
+        except Exception as exc:  # noqa: BLE001
             logger.exception("RAG 流程异常，降级纯 LLM: %s", exc)
-            rag_reply = None
-        if rag_reply is not None:
-            if isinstance(session, dict) and used_rag_flag:
+            pair = None
+        if pair is not None:
+            if isinstance(session, dict):
                 session["last_reply_used_rag"] = True
             _session_note_last_user(session, user_text)
-            return rag_reply
+            system, user_block = pair
+            yield from llm.stream_chat(system, user_block)
+            return
 
-    # ---------- 无检索命中 / 不启用 RAG / 或知识库为空：需求中的「纯 LLM 降级」----------
     if isinstance(session, dict):
         session["last_reply_used_rag"] = False
     if intent == UserIntent.MOCK_INTERVIEW:
-        # 未命中面经/语料时仍以「面试官」身份提问，避免退化成普通答疑口吻
         system = (
             "你是数据开发（DE）方向的技术面试官，正在与用户进行模拟面试。"
             "当前未命中本地知识库片段，请仍用贴近真实技术面试的方式出题、追问或点评（视用户上一句而定），中文回复。"
@@ -874,12 +910,20 @@ def run_agent_turn(
             "若用户想深入，可分点说明。"
         )
     try:
-        reply = llm.simple_chat(system, user_text)
         _session_note_last_user(session, user_text)
-        return reply
+        yield from llm.stream_chat(system, user_text)
     except Exception as exc:  # noqa: BLE001
         logger.exception("聊天失败: %s", exc)
-        return "抱歉，服务暂时不可用，请稍后再试。"
+        yield "抱歉，服务暂时不可用，请稍后再试。"
+
+
+def run_agent_turn(
+    user_text: str,
+    session: Mapping[str, Any],
+    llm: QwenClient,
+) -> str:
+    """非流式聚合版（测试/脚本用）；前端请配合 ``run_agent_turn_iter`` 与 ``st.write_stream``。"""
+    return "".join(run_agent_turn_iter(user_text, session, llm))
 
 
 def _session_note_last_user(session: Mapping[str, Any], user_text: str) -> None:
